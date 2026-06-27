@@ -2335,6 +2335,13 @@ pub mod bus {
     }
 
     #[inline]
+    fn is_eeprom_region(&self, addr: u32) -> bool {
+      matches!(self.backup, BackupMedia::Eeprom(_))
+        && addr >> 24 == 0x0D
+        && (self.rom.len() <= 16 * 1024 * 1024 || (addr & 0x01FF_FFFF) >= 0x01FF_FF00)
+    }
+
+    #[inline]
     pub fn read8(&mut self, addr: u32) -> u8 {
       self.add_mem_cycles(addr, 1);
       let val = match addr >> 24 {
@@ -2345,6 +2352,7 @@ pub mod bus {
         0x05 => self.palette[(addr & 0x3FF) as usize],
         0x06 => self.read_vram8(addr),
         0x07 => self.oam[(addr & 0x3FF) as usize],
+        0x0D if self.is_eeprom_region(addr) => self.backup.peek(addr & 0xFFFF),
         0x08..=0x0D => self.read_rom8(addr),
         0x0E..=0x0F => self.backup.read(addr & 0xFFFF),
         _ => (self.last_read & 0xFF) as u8,
@@ -2381,10 +2389,15 @@ pub mod bus {
           let base = (addr & 0x3FF) as usize;
           u16::from_le_bytes([self.oam[base], self.oam[base + 1]])
         }
+        0x0D if self.is_eeprom_region(addr) => self.backup.read(addr & 0xFFFF) as u16,
         0x08..=0x0D => self.read_rom16(addr),
         0x0E..=0x0F => {
           let b = self.backup.read(addr & 0xFFFF) as u16;
-          b | (b << 8)
+          if matches!(self.backup, BackupMedia::Eeprom(_)) {
+            b
+          } else {
+            b | (b << 8)
+          }
         }
         _ => self.last_read as u16,
       };
@@ -2443,6 +2456,7 @@ pub mod bus {
             self.oam[base + 3],
           ])
         }
+        0x0D if self.is_eeprom_region(addr) => self.backup.read(addr & 0xFFFF) as u32,
         0x08..=0x0D => {
           let lo = self.read_rom16(addr) as u32;
           let hi = self.read_rom16(addr + 2) as u32;
@@ -2450,7 +2464,11 @@ pub mod bus {
         }
         0x0E..=0x0F => {
           let b = self.backup.read(addr & 0xFFFF) as u32;
-          b | (b << 8) | (b << 16) | (b << 24)
+          if matches!(self.backup, BackupMedia::Eeprom(_)) {
+            b
+          } else {
+            b | (b << 8) | (b << 16) | (b << 24)
+          }
         }
         _ => {
           let lo = self.read16(addr) as u32;
@@ -2482,6 +2500,7 @@ pub mod bus {
           }
         }
         0x07 => {}
+        0x0D if self.is_eeprom_region(addr) => self.backup.write(addr & 0xFFFF, val),
         0x08..=0x0D => {
           if self.rtc.enabled {
             let rel = addr & 0x01FF_FFFF;
@@ -2542,6 +2561,7 @@ pub mod bus {
           self.oam[base] = bytes[0];
           self.oam[base + 1] = bytes[1];
         }
+        0x0D if self.is_eeprom_region(addr) => self.backup.write(addr & 0xFFFF, val as u8),
         0x08..=0x0D if self.rtc.enabled => {
           let rel = addr & 0x01FF_FFFE;
           match rel {
@@ -2603,6 +2623,7 @@ pub mod bus {
       match addr >> 24 {
         0x02 => self.ewram[(addr & 0x3FFFF) as usize],
         0x03 => self.iwram[(addr & 0x7FFF) as usize],
+        0x0D if self.is_eeprom_region(addr) => self.backup.peek(addr & 0xFFFF),
         0x08..=0x0D => {
           let offset = (addr & 0x01FF_FFFF) as usize;
           if offset < self.rom.len() {
@@ -6056,6 +6077,7 @@ pub mod backup {
       CmdType,
       Address,
       Data,
+      WriteStop,
       ReadOut,
       WriteDone,
     }
@@ -6097,6 +6119,24 @@ pub mod backup {
         }
       }
 
+      pub fn load_bytes(&mut self, data: &[u8]) {
+        let size = if data.len() <= 512 { 512 } else { 8 * 1024 };
+        self.data = vec![0xFF; size];
+        let len = data.len().min(size);
+        self.data[..len].copy_from_slice(&data[..len]);
+        self.size = if size == 512 {
+          SizeKind::Small
+        } else {
+          SizeKind::Large
+        };
+        self.addr_width = if size == 512 { 6 } else { 14 };
+        self.state = State::Idle;
+        self.bit_buf = 0;
+        self.bits_in = 0;
+        self.read_buf = 0;
+        self.read_bits_left = 0;
+      }
+
       fn effective_addr_width(&self) -> u32 {
         match self.size {
           SizeKind::Small => 6,
@@ -6111,13 +6151,27 @@ pub mod backup {
         }
       }
 
-      pub fn read(&self, _addr: u32) -> u8 {
+      pub fn peek(&self, _addr: u32) -> u8 {
         match self.state {
           State::ReadOut if self.read_bits_left > 64 => 0,
           State::ReadOut if self.read_bits_left > 0 => ((self.read_buf >> 63) & 1) as u8,
           State::WriteDone => 1,
           _ => 1,
         }
+      }
+
+      pub fn read(&mut self, addr: u32) -> u8 {
+        let bit = self.peek(addr);
+        if self.state == State::ReadOut && self.read_bits_left > 0 {
+          self.read_bits_left -= 1;
+          if self.read_bits_left < 64 {
+            self.read_buf <<= 1;
+          }
+          if self.read_bits_left == 0 {
+            self.state = State::Idle;
+          }
+        }
+        bit
       }
 
       pub fn write(&mut self, _addr: u32, val: u8) {
@@ -6170,26 +6224,18 @@ pub mod backup {
             } else {
               self.bit_buf = (self.bit_buf << 1) | bit;
               self.bits_in += 1;
-              if self.bits_in >= 65 {
-                let data = self.bit_buf >> 1;
-                self.store_data(data);
-                self.state = State::WriteDone;
+              if self.bits_in == 64 {
+                self.store_data(self.bit_buf);
+                self.state = State::WriteStop;
                 self.bit_buf = 0;
                 self.bits_in = 0;
               }
             }
           }
-          State::ReadOut => {
-            if self.read_bits_left > 0 {
-              self.read_bits_left -= 1;
-              if self.read_bits_left < 64 {
-                self.read_buf <<= 1;
-              }
-            }
-            if self.read_bits_left == 0 {
-              self.state = State::Idle;
-            }
+          State::WriteStop => {
+            self.state = State::WriteDone;
           }
+          State::ReadOut => {}
         }
       }
 
@@ -6233,7 +6279,6 @@ pub mod backup {
         for _ in 0..count {
           let bit = eeprom.read(0) as u64;
           result = (result << 1) | bit;
-          eeprom.write(0, 0);
         }
         result
       }
@@ -6269,6 +6314,35 @@ pub mod backup {
         send_bits(&mut eeprom, 0, 1);
         assert_eq!(eeprom.read(0), 1);
       }
+
+      #[test]
+      fn eeprom_write_preserves_first_data_bit() {
+        let mut eeprom = Eeprom::new();
+        eeprom.size = SizeKind::Small;
+        eeprom.addr_width = 6;
+        send_bits(&mut eeprom, 0b10, 2);
+        send_bits(&mut eeprom, 0, 6);
+        send_bits(&mut eeprom, 0xFEDC_BA98_7654_3210, 64);
+        send_bits(&mut eeprom, 0, 1);
+        assert_eq!(&eeprom.data[..8], &0xFEDC_BA98_7654_3210u64.to_be_bytes());
+      }
+
+      #[test]
+      fn eeprom_readout_advances_on_reads() {
+        let mut eeprom = Eeprom::new();
+        eeprom.size = SizeKind::Small;
+        eeprom.addr_width = 6;
+        eeprom.data[..8].copy_from_slice(&0x8000_0000_0000_0001u64.to_be_bytes());
+        send_bits(&mut eeprom, 0b11, 2);
+        send_bits(&mut eeprom, 0, 6);
+        send_bits(&mut eeprom, 0, 1);
+        let mut bits = 0u128;
+        for _ in 0..68 {
+          bits = (bits << 1) | eeprom.read(0) as u128;
+        }
+        assert_eq!(bits >> 64, 0);
+        assert_eq!(bits as u64, 0x8000_0000_0000_0001);
+      }
     }
   }
   use serde::{Deserialize, Serialize};
@@ -6282,7 +6356,16 @@ pub mod backup {
   }
 
   impl BackupMedia {
-    pub fn read(&self, addr: u32) -> u8 {
+    pub fn peek(&self, addr: u32) -> u8 {
+      match self {
+        BackupMedia::None => 0xFF,
+        BackupMedia::Sram(s) => s.read(addr),
+        BackupMedia::Flash(f) => f.read(addr),
+        BackupMedia::Eeprom(e) => e.peek(addr),
+      }
+    }
+
+    pub fn read(&mut self, addr: u32) -> u8 {
       match self {
         BackupMedia::None => 0xFF,
         BackupMedia::Sram(s) => s.read(addr),
@@ -8390,8 +8473,7 @@ impl Gba {
         f.data[..len].copy_from_slice(&data[..len]);
       }
       backup::BackupMedia::Eeprom(e) => {
-        let len = data.len().min(e.data.len());
-        e.data[..len].copy_from_slice(&data[..len]);
+        e.load_bytes(data);
       }
     }
   }
@@ -8483,6 +8565,26 @@ mod tests {
     gba.bus.backup = backup::BackupMedia::Sram(backup::sram::Sram::new());
     gba.load_save_bytes(&[1, 2, 3, 4]);
     assert_eq!(gba.save_bytes().unwrap()[..4], [1, 2, 3, 4]);
+  }
+
+  #[test]
+  fn eeprom_rom_maps_backup_at_0d_region() {
+    let mut rom = make_loop_rom();
+    rom.extend_from_slice(b"EEPROM_V122");
+    let mut gba = Gba::new(None, rom);
+    assert!(matches!(gba.bus.backup, backup::BackupMedia::Eeprom(_)));
+    assert_eq!(gba.bus.read16(0x0D00_0000), 1);
+  }
+
+  #[test]
+  fn eeprom_load_save_bytes_preserves_loaded_size() {
+    let mut rom = make_loop_rom();
+    rom.extend_from_slice(b"EEPROM_V122");
+    let mut gba = Gba::new(None, rom);
+    gba.load_save_bytes(&vec![0xAA; 512]);
+    let save = gba.save_bytes().unwrap();
+    assert_eq!(save.len(), 512);
+    assert!(save.iter().all(|&b| b == 0xAA));
   }
 
   #[test]
