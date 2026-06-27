@@ -1,6 +1,6 @@
-# gma-rs
+# gba-rs
 
-`gma-rs` is a single-source Rust Game Boy Advance emulator. Core emulation, SDL2 frontend, save handling, harness mode, and tests live in `src/main.rs`
+`gba-rs` is a single-source Rust Game Boy Advance emulator. Core emulation, SDL2 frontend, save handling, harness mode, and tests live in `src/main.rs`
 
 ## Requirements
 
@@ -17,7 +17,7 @@ rustup toolchain install 1.96.0
 cargo build --release
 ```
 
-The optimized binary is `target/release/gma-rs`.
+The optimized binary is `target/release/gba-rs`.
 
 ## Run
 

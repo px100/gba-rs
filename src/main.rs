@@ -9405,7 +9405,7 @@ fn next_arg(it: &mut impl Iterator<Item = String>, flag: &str) -> String {
 
 fn print_help() {
   println!(
-    "Usage: gma-rs [OPTIONS] [ROM]\n\nOptions:\n  -b, --bios <PATH>\n      --skip-bios\n  -s, --scale <N>\n      --no-audio\n      --harness\n      --test-pattern\n      --test-solid-red\n  -h, --help"
+    "Usage: gba-rs [OPTIONS] [ROM]\n\nOptions:\n  -b, --bios <PATH>\n      --skip-bios\n  -s, --scale <N>\n      --no-audio\n      --harness\n      --test-pattern\n      --test-solid-red\n  -h, --help"
   );
 }
 
